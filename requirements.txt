@@ -1,0 +1,28 @@
+# Innovate UK Scraper - Requirements
+
+# Web scraping
+requests==2.32.3
+beautifulsoup4==4.12.3
+urllib3==2.2.3
+
+# Date parsing
+python-dateutil==2.9.0
+
+# Database
+psycopg2-binary==2.9.9
+
+# Vector search
+pinecone-client==5.0.1
+
+# OpenAI
+openai==1.54.4
+
+# Progress bars
+tqdm==4.66.5
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Optional: PDF parsing (if you enable resource fetching)
+# PyPDF2==3.0.1
+# pdfplumber==0.11.4

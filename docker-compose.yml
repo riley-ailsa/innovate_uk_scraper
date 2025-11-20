@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  scraper:
+    build: .
+    container_name: innovate-uk-scraper
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./innovate_uk_urls.txt:/app/innovate_uk_urls.txt
+    restart: unless-stopped
+    # Run daily at 2 AM using cron (install crond in Dockerfile if needed)
+    # Or use external scheduler (k8s CronJob, AWS EventBridge, etc.)
