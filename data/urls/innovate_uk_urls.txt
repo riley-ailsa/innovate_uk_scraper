@@ -39,3 +39,7 @@ https://apply-for-innovation-funding.service.gov.uk/competition/2333/overview/f5
 https://apply-for-innovation-funding.service.gov.uk/competition/2334/overview/4af06b80-2953-4cb3-8cc0-987ec5a2f322
 https://apply-for-innovation-funding.service.gov.uk/competition/2335/overview/64e26f1b-8564-4539-b3ca-1b15ebf4f94a
 https://apply-for-innovation-funding.service.gov.uk/competition/2341/overview/4b0efce9-75b8-4e84-97c0-fc6277396586
+
+# Auto-discovered on 2025-12-03 16:52
+https://apply-for-innovation-funding.service.gov.uk/competition/2337/overview/3750b1cd-2080-4a1c-82c0-003fbaafdd2d
+https://apply-for-innovation-funding.service.gov.uk/competition/2354/overview/c7008321-f651-45c5-a409-c3215231fbb4
