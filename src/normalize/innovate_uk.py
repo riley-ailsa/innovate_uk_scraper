@@ -4,17 +4,28 @@ Normalization functions for Innovate UK scraper output.
 Converts ScrapedCompetition objects into canonical domain models:
 - Grant (canonical competition)
 - IndexableDocument (sections + resources)
+
+Includes:
+- Competition type detection (grant/loan/prize)
+- Per-project funding extraction
+- Expected winners calculation
 """
 
 import re
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from src.core.domain_models import Grant, IndexableDocument
 from src.ingest.innovatuk_types import ScrapedCompetition
 from src.core.models import Document
 from src.core.money import parse_gbp_amount
 from src.core.time_utils import infer_status
+from src.core.constants import (
+    COMPETITION_TYPE_GRANT,
+    COMPETITION_TYPE_LOAN,
+    COMPETITION_TYPE_PRIZE,
+    TYPICAL_PROJECT_PERCENT,
+)
 
 # Prize funding patterns for fallback detection
 _PRIZE_PAT = re.compile(
@@ -155,6 +166,11 @@ def normalize_scraped_competition(
     """
     Convert ScrapedCompetition + Documents into canonical domain models.
 
+    Includes:
+    - Competition type detection (grant/loan/prize)
+    - Per-project funding extraction
+    - Expected winners calculation
+
     Args:
         scraped: Raw scraped competition data
         documents: Fetched documents from resources
@@ -168,13 +184,26 @@ def normalize_scraped_competition(
     raw_total_fund = comp.total_fund or ""
     total_fund_display, total_fund_gbp = parse_gbp_amount(raw_total_fund)
 
+    # Parse per-project funding from project_size
+    project_funding_min, project_funding_max = _parse_project_funding(comp.project_size)
+
+    # Calculate expected winners
+    expected_winners = _calculate_expected_winners(
+        total_fund_gbp, project_funding_min, project_funding_max
+    )
+
+    # Detect competition type
+    title = _clean_title(comp.title)
+    description = comp.description or ""
+    competition_type = _detect_competition_type(title, description)
+
     # 1. Create canonical Grant
     grant = Grant(
         id=f"innovate_uk_{comp.id}",
         source="innovate_uk",
         external_id=comp.external_id,
-        title=_clean_title(comp.title),
-        description=comp.description or "",
+        title=title,
+        description=description,
         url=comp.base_url,
         opens_at=comp.opens_at,
         closes_at=comp.closes_at,
@@ -182,6 +211,10 @@ def normalize_scraped_competition(
         total_fund=total_fund_display,
         total_fund_gbp=total_fund_gbp,
         project_size=comp.project_size,
+        project_funding_min=project_funding_min,
+        project_funding_max=project_funding_max,
+        expected_winners=expected_winners,
+        competition_type=competition_type,
         funding_rules=comp.funding_rules,
         tags=_extract_tags(comp),
         scraped_at=datetime.utcnow(),
@@ -248,6 +281,135 @@ def normalize_scraped_competition(
     grant = apply_prize_funding_fallback(grant, scraped)
 
     return grant, indexable_docs
+
+
+def _detect_competition_type(title: str, description: str) -> str:
+    """
+    Detect if competition is grant, loan, or prize.
+
+    Args:
+        title: Competition title
+        description: Competition description
+
+    Returns:
+        Competition type: "grant", "loan", or "prize"
+    """
+    title_lower = title.lower()
+    desc_lower = description.lower()
+
+    # Check for loan indicators
+    loan_indicators = [
+        "loan" in title_lower,
+        "innovation loan" in desc_lower,
+        "loans for" in desc_lower,
+        "loan funding" in desc_lower,
+    ]
+    if any(loan_indicators):
+        return COMPETITION_TYPE_LOAN
+
+    # Check for prize indicators
+    prize_indicators = [
+        "prize" in title_lower,
+        "challenge prize" in desc_lower,
+        "prize pot" in desc_lower,
+        "prize fund" in desc_lower,
+        "prize competition" in desc_lower,
+    ]
+    if any(prize_indicators):
+        return COMPETITION_TYPE_PRIZE
+
+    # Default to grant
+    return COMPETITION_TYPE_GRANT
+
+
+def _parse_project_funding(project_size: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Parse per-project funding amounts from project_size string.
+
+    Args:
+        project_size: Project size string like "£150,000 to £750,000"
+
+    Returns:
+        Tuple of (min_amount, max_amount) in GBP
+    """
+    if not project_size:
+        return None, None
+
+    # Pattern for range: "£X to £Y" or "£X - £Y"
+    range_pattern = r"£\s*([\d,]+)\s*(?:k|thousand)?\s*(?:to|-)\s*£\s*([\d,]+)\s*(k|thousand|m|million)?"
+    match = re.search(range_pattern, project_size, re.IGNORECASE)
+
+    if match:
+        min_str = match.group(1).replace(",", "")
+        max_str = match.group(2).replace(",", "")
+        mult = match.group(3)
+
+        min_val = float(min_str)
+        max_val = float(max_str)
+
+        # Apply multiplier to max (and min if it's small)
+        if mult:
+            mult_lower = mult.lower()
+            if mult_lower in ("k", "thousand"):
+                max_val *= 1_000
+                if min_val < 1000:
+                    min_val *= 1_000
+            elif mult_lower in ("m", "million"):
+                max_val *= 1_000_000
+                if min_val < 1000:
+                    min_val *= 1_000
+
+        return int(min_val), int(max_val)
+
+    # Pattern for single value: "up to £X"
+    single_pattern = r"(?:up to|maximum)\s*£\s*([\d,]+)\s*(k|thousand|m|million)?"
+    match = re.search(single_pattern, project_size, re.IGNORECASE)
+
+    if match:
+        max_str = match.group(1).replace(",", "")
+        mult = match.group(2)
+
+        max_val = float(max_str)
+
+        if mult:
+            mult_lower = mult.lower()
+            if mult_lower in ("k", "thousand"):
+                max_val *= 1_000
+            elif mult_lower in ("m", "million"):
+                max_val *= 1_000_000
+
+        return None, int(max_val)
+
+    return None, None
+
+
+def _calculate_expected_winners(
+    total_fund_gbp: Optional[int],
+    project_min: Optional[int],
+    project_max: Optional[int],
+) -> Optional[int]:
+    """
+    Calculate expected number of winners.
+
+    Uses 70% of max project funding as typical project size (per SME feedback).
+
+    Args:
+        total_fund_gbp: Total funding pot in GBP
+        project_min: Minimum per-project funding in GBP
+        project_max: Maximum per-project funding in GBP
+
+    Returns:
+        Expected number of winners or None if calculation not possible
+    """
+    if not total_fund_gbp or not project_max:
+        return None
+
+    # Use 70% heuristic per SME feedback
+    typical_project = int(project_max * TYPICAL_PROJECT_PERCENT)
+    if typical_project <= 0:
+        return None
+
+    return total_fund_gbp // typical_project
 
 
 def _infer_is_active(opens_at, closes_at) -> bool:

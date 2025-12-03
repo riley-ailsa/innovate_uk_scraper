@@ -9,7 +9,7 @@ urllib3==2.2.3
 python-dateutil==2.9.0
 
 # Database
-psycopg2-binary==2.9.9
+pymongo==4.10.1
 
 # Vector search
 pinecone-client==5.0.1

@@ -36,6 +36,14 @@ class Grant:
     total_fund_gbp: Optional[int] = None  # Numeric value: 4_000_000
     project_size: Optional[str] = None
 
+    # Per-project funding (SME-requested feature)
+    project_funding_min: Optional[int] = None  # Minimum per-project funding in GBP
+    project_funding_max: Optional[int] = None  # Maximum per-project funding in GBP
+    expected_winners: Optional[int] = None  # Calculated expected number of winners
+
+    # Competition type: "grant", "loan", or "prize"
+    competition_type: str = "grant"
+
     # Structured funding rules (if available)
     funding_rules: Dict[str, Any] = field(default_factory=dict)
 

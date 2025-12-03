@@ -69,25 +69,34 @@ CREATE TABLE grants (
     budget_min BIGINT,
     budget_max BIGINT,
     funding_rate_percent INTEGER,  -- e.g., 100 for 100% funding
-    
+
+    -- Per-project funding (SME-requested feature)
+    project_funding_min BIGINT,      -- Minimum per-project funding in GBP
+    project_funding_max BIGINT,      -- Maximum per-project funding in GBP
+    expected_winners INTEGER,         -- Expected number of winners (calculated)
+
+    -- Competition type (grant, loan, or prize)
+    competition_type VARCHAR(20) DEFAULT 'grant',  -- 'grant', 'loan', 'prize'
+
     -- Eligibility
     eligible_countries TEXT[],
     organization_types TEXT[],  -- Who can apply
     consortium_required BOOLEAN,
     min_partners INTEGER,
-    
+
     -- Content (summary only, full text in Pinecone)
     description_summary TEXT,  -- First 500 chars
-    
+
     -- Metadata
     scraped_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     pinecone_synced_at TIMESTAMP WITH TIME ZONE,
-    
+
     -- Search optimization
     tsv_title tsvector GENERATED ALWAYS AS (to_tsvector('english', title)) STORED,
-    
-    CONSTRAINT valid_dates CHECK (close_date >= open_date OR open_date IS NULL)
+
+    CONSTRAINT valid_dates CHECK (close_date >= open_date OR open_date IS NULL),
+    CONSTRAINT valid_competition_type CHECK (competition_type IN ('grant', 'loan', 'prize'))
 );
 
 -- Indexes for fast filtering
@@ -98,6 +107,7 @@ CREATE INDEX idx_grants_tags ON grants USING GIN(tags);
 CREATE INDEX idx_grants_programme ON grants(programme);
 CREATE INDEX idx_grants_budget ON grants(budget_min, budget_max);
 CREATE INDEX idx_grants_tsv_title ON grants USING GIN(tsv_title);
+CREATE INDEX idx_grants_competition_type ON grants(competition_type);
 
 
 -- ============================================================================
@@ -289,7 +299,7 @@ ORDER BY close_date ASC NULLS LAST;
 
 -- User engagement summary
 CREATE VIEW user_engagement AS
-SELECT 
+SELECT
     u.user_id,
     u.email,
     COUNT(DISTINCT i.grant_id) as grants_viewed,
@@ -300,3 +310,23 @@ FROM users u
 LEFT JOIN user_interactions i ON u.user_id = i.user_id
 LEFT JOIN saved_grants s ON u.user_id = s.user_id
 GROUP BY u.user_id, u.email;
+
+
+-- ============================================================================
+-- MIGRATION SCRIPT - Run this to add new columns to existing databases
+-- ============================================================================
+
+-- Add new columns to existing grants table (idempotent - safe to run multiple times)
+-- Run this separately on existing databases:
+
+-- ALTER TABLE grants ADD COLUMN IF NOT EXISTS competition_type VARCHAR(20) DEFAULT 'grant';
+-- ALTER TABLE grants ADD COLUMN IF NOT EXISTS project_funding_min BIGINT;
+-- ALTER TABLE grants ADD COLUMN IF NOT EXISTS project_funding_max BIGINT;
+-- ALTER TABLE grants ADD COLUMN IF NOT EXISTS expected_winners INTEGER;
+
+-- Add constraint (requires PostgreSQL 9.4+)
+-- ALTER TABLE grants DROP CONSTRAINT IF EXISTS valid_competition_type;
+-- ALTER TABLE grants ADD CONSTRAINT valid_competition_type CHECK (competition_type IN ('grant', 'loan', 'prize'));
+
+-- Create index for competition type
+-- CREATE INDEX IF NOT EXISTS idx_grants_competition_type ON grants(competition_type);

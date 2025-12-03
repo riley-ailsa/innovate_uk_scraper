@@ -6,15 +6,24 @@ This module handles:
 2. Parsing metadata (title, dates, funding rules, project sizes)
 3. Extracting sections with fragment URLs
 4. Classifying supporting resources
+5. Detecting competition type (grant/loan/prize)
+6. Extracting per-project funding amounts
 """
 
 import re
 import logging
+import time
+import random
+import traceback
+from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
+
 from urllib.parse import urlparse, urljoin
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup, Tag
 import certifi
 
@@ -31,6 +40,20 @@ from src.core.utils import (
     clean_text,
     extract_money_amount,
 )
+from src.core.constants import (
+    DEFAULT_HEADERS,
+    REQUEST_TIMEOUT,
+    MAX_RETRIES,
+    BACKOFF_FACTOR,
+    RETRY_STATUS_CODES,
+    RATE_LIMIT_DELAY_MIN,
+    RATE_LIMIT_DELAY_MAX,
+    TYPICAL_PROJECT_PERCENT,
+    COMPETITION_TYPE_GRANT,
+    COMPETITION_TYPE_LOAN,
+    COMPETITION_TYPE_PRIZE,
+    SECTION_ANCHORS,
+)
 from src.ingest.innovatuk_types import ScrapedCompetition
 
 
@@ -39,45 +62,165 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1"
-}
+@dataclass
+class ProjectFunding:
+    """
+    Per-project funding information.
+
+    Attributes:
+        min_amount: Minimum project funding in GBP
+        max_amount: Maximum project funding in GBP
+        typical_amount: Typical project funding (70% of max heuristic)
+        display_text: Original text as shown on page
+    """
+    min_amount: Optional[int] = None
+    max_amount: Optional[int] = None
+    typical_amount: Optional[int] = None
+    display_text: Optional[str] = None
+
+
+@dataclass
+class ExpectedWinners:
+    """
+    Expected number of winners calculation.
+
+    Attributes:
+        min_winners: Minimum winners (if all projects at max funding)
+        max_winners: Maximum winners (if all projects at min funding)
+        expected_winners: Expected winners (assuming typical 70% of max)
+    """
+    min_winners: Optional[int] = None
+    max_winners: Optional[int] = None
+    expected_winners: Optional[int] = None
+
+
+def _create_session_with_retry() -> requests.Session:
+    """
+    Create a requests session with retry logic and exponential backoff.
+
+    Returns:
+        Configured requests.Session with retry adapter
+    """
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=RETRY_STATUS_CODES,
+        allowed_methods=["GET"],
+        raise_on_status=False,  # We'll handle status ourselves
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update(DEFAULT_HEADERS)
+    return session
+
+
+def detect_competition_type(title: str, description: str) -> str:
+    """
+    Detect if competition is grant, loan, or prize.
+
+    Args:
+        title: Competition title
+        description: Competition description
+
+    Returns:
+        Competition type: "grant", "loan", or "prize"
+    """
+    title_lower = title.lower()
+    desc_lower = description.lower()
+
+    # Check for loan indicators
+    loan_indicators = [
+        "loan" in title_lower,
+        "innovation loan" in desc_lower,
+        "loans for" in desc_lower,
+        "loan funding" in desc_lower,
+    ]
+    if any(loan_indicators):
+        return COMPETITION_TYPE_LOAN
+
+    # Check for prize indicators
+    prize_indicators = [
+        "prize" in title_lower,
+        "challenge prize" in desc_lower,
+        "prize pot" in desc_lower,
+        "prize fund" in desc_lower,
+        "prize competition" in desc_lower,
+    ]
+    if any(prize_indicators):
+        return COMPETITION_TYPE_PRIZE
+
+    # Default to grant
+    return COMPETITION_TYPE_GRANT
+
+
+def calculate_expected_winners(
+    total_fund_gbp: Optional[int],
+    project_min: Optional[int],
+    project_max: Optional[int],
+) -> Optional[ExpectedWinners]:
+    """
+    Calculate expected number of winners based on funding amounts.
+
+    Args:
+        total_fund_gbp: Total funding pot in GBP
+        project_min: Minimum per-project funding in GBP
+        project_max: Maximum per-project funding in GBP
+
+    Returns:
+        ExpectedWinners object or None if calculation not possible
+    """
+    if not total_fund_gbp or not project_max:
+        return None
+
+    min_winners = total_fund_gbp // project_max
+
+    max_winners = None
+    if project_min and project_min > 0:
+        max_winners = total_fund_gbp // project_min
+
+    # Use 70% heuristic per SME feedback
+    typical_project = int(project_max * TYPICAL_PROJECT_PERCENT)
+    expected_winners = total_fund_gbp // typical_project if typical_project > 0 else None
+
+    return ExpectedWinners(
+        min_winners=min_winners,
+        max_winners=max_winners,
+        expected_winners=expected_winners,
+    )
 
 
 class InnovateUKCompetitionScraper:
     """
     Scrapes a single Innovate UK competition overview page.
 
+    Features:
+    - Retry logic with exponential backoff
+    - Rate limiting between requests
+    - SSL certificate handling
+    - Competition type detection (grant/loan/prize)
+    - Per-project funding extraction
+    - Expected winners calculation
+
     Usage:
         scraper = InnovateUKCompetitionScraper()
         result = scraper.scrape_competition(url)
     """
 
-    # Known section anchors in competition pages
-    SECTION_ANCHORS = {
-        "summary": "summary",
-        "eligibility": "eligibility",
-        "scope": "scope",
-        "dates": "dates",
-        "how-to-apply": "how-to-apply",
-        "supporting-information": "supporting-information",
-    }
+    # Use constants from the constants module
+    SECTION_ANCHORS = SECTION_ANCHORS
 
     def __init__(self, session: Optional[requests.Session] = None):
         """
-        Initialize scraper.
+        Initialize scraper with retry-enabled session.
 
         Args:
-            session: Optional requests.Session for connection pooling
+            session: Optional requests.Session for connection pooling.
+                     If not provided, creates session with retry logic.
         """
-        self.session = session or requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
+        self.session = session or _create_session_with_retry()
+        self._last_request_time: Optional[float] = None
 
     def scrape_competition(self, overview_url: str) -> ScrapedCompetition:
         """
@@ -119,9 +262,30 @@ class InnovateUKCompetitionScraper:
             resources=resources,
         )
 
+    def _apply_rate_limit(self) -> None:
+        """
+        Apply rate limiting between requests.
+
+        Adds a random delay between RATE_LIMIT_DELAY_MIN and RATE_LIMIT_DELAY_MAX
+        to avoid overwhelming the server.
+        """
+        if self._last_request_time is not None:
+            elapsed = time.time() - self._last_request_time
+            min_delay = RATE_LIMIT_DELAY_MIN
+            if elapsed < min_delay:
+                delay = random.uniform(RATE_LIMIT_DELAY_MIN, RATE_LIMIT_DELAY_MAX)
+                logger.debug(f"Rate limiting: sleeping {delay:.2f}s")
+                time.sleep(delay)
+
     def _get(self, url: str) -> str:
         """
-        Fetch URL and return HTML.
+        Fetch URL and return HTML with proper SSL handling.
+
+        Features:
+        - Rate limiting between requests
+        - SSL certificate verification using certifi
+        - Detailed error logging
+        - Retry logic (via session adapter)
 
         Args:
             url: URL to fetch
@@ -130,19 +294,40 @@ class InnovateUKCompetitionScraper:
             HTML string
 
         Raises:
-            requests.HTTPError: If request fails
+            requests.RequestException: If request fails after retries
         """
+        # Apply rate limiting
+        self._apply_rate_limit()
+
         try:
-            # Temporarily disable SSL verification for UK gov sites (SSL cert issue)
-            # TODO: Fix SSL certificate chain for apply-for-innovation-funding.service.gov.uk
-            resp = self.session.get(url, timeout=15, verify=False)
+            # Use certifi for SSL verification
+            resp = self.session.get(
+                url,
+                timeout=REQUEST_TIMEOUT,
+                verify=certifi.where(),
+            )
+            self._last_request_time = time.time()
+
+            # Check for HTTP errors
             resp.raise_for_status()
             return resp.text
-        except requests.Timeout:
-            logger.error(f"Timeout fetching {url}")
+
+        except requests.exceptions.SSLError as e:
+            logger.error(f"SSL certificate error fetching {url}: {e}")
+            logger.debug(traceback.format_exc())
             raise
+
+        except requests.Timeout:
+            logger.error(f"Timeout fetching {url} (timeout={REQUEST_TIMEOUT}s)")
+            raise
+
         except requests.HTTPError as e:
-            logger.error(f"HTTP error fetching {url}: {e}")
+            logger.error(f"HTTP error fetching {url}: {e.response.status_code} {e.response.reason}")
+            raise
+
+        except requests.RequestException as e:
+            logger.error(f"Network error fetching {url}: {e}")
+            logger.debug(traceback.format_exc())
             raise
 
     def _parse_competition_meta(
@@ -344,6 +529,108 @@ class InnovateUKCompetitionScraper:
 
         logger.debug(f"Project size: {project_size}")
         return project_size
+
+    def _extract_per_project_funding(self, soup: BeautifulSoup) -> ProjectFunding:
+        """
+        Extract per-project funding amounts with structured data.
+
+        Looks for patterns like:
+        - "£150k to £750k per project"
+        - "Projects can be between £X and £Y"
+        - "Individual grant awards of up to £X"
+        - "Project size: £100,000 to £500,000"
+
+        Args:
+            soup: Parsed HTML
+
+        Returns:
+            ProjectFunding object with min, max, and typical amounts
+        """
+        text_all = soup.get_text(" ", strip=True)
+        text_lower = text_all.lower()
+
+        min_amount = None
+        max_amount = None
+        display_text = None
+
+        # Pattern 1: "£Xk to £Yk" or "£X to £Y"
+        range_patterns = [
+            # £150k to £750k
+            r"£\s*([\d,]+)\s*(k|thousand)?\s*to\s*£\s*([\d,]+)\s*(k|thousand|m|million)?",
+            # £150,000 to £750,000
+            r"£\s*([\d,]+)\s*to\s*£\s*([\d,]+)",
+            # between £X and £Y
+            r"between\s*£\s*([\d,]+)\s*(k|thousand)?\s*and\s*£\s*([\d,]+)\s*(k|thousand|m|million)?",
+        ]
+
+        for pattern in range_patterns:
+            match = re.search(pattern, text_all, re.IGNORECASE)
+            if match:
+                groups = match.groups()
+
+                # Parse first amount
+                first_num = float(groups[0].replace(",", ""))
+                first_mult = groups[1] if len(groups) > 1 else None
+
+                if first_mult:
+                    mult_lower = first_mult.lower() if first_mult else ""
+                    if mult_lower in ("k", "thousand"):
+                        first_num *= 1_000
+                    elif mult_lower in ("m", "million"):
+                        first_num *= 1_000_000
+
+                # Parse second amount
+                second_idx = 2 if len(groups) > 2 else 1
+                second_num = float(groups[second_idx].replace(",", "")) if groups[second_idx] else None
+                second_mult = groups[second_idx + 1] if len(groups) > second_idx + 1 else None
+
+                if second_num:
+                    if second_mult:
+                        mult_lower = second_mult.lower() if second_mult else ""
+                        if mult_lower in ("k", "thousand"):
+                            second_num *= 1_000
+                        elif mult_lower in ("m", "million"):
+                            second_num *= 1_000_000
+
+                    # If first amount is small (< 1000), it's likely in thousands
+                    if first_num < 1000 and second_num >= 1000:
+                        first_num *= 1_000
+
+                    min_amount = int(first_num)
+                    max_amount = int(second_num)
+                    display_text = match.group(0)
+                    break
+
+        # Pattern 2: "up to £X" (max only)
+        if max_amount is None:
+            up_to_match = re.search(
+                r"(?:up to|maximum of)\s*£\s*([\d,]+)\s*(k|thousand|m|million)?",
+                text_all,
+                re.IGNORECASE
+            )
+            if up_to_match:
+                amount = float(up_to_match.group(1).replace(",", ""))
+                mult = up_to_match.group(2)
+                if mult:
+                    mult_lower = mult.lower()
+                    if mult_lower in ("k", "thousand"):
+                        amount *= 1_000
+                    elif mult_lower in ("m", "million"):
+                        amount *= 1_000_000
+                max_amount = int(amount)
+                display_text = up_to_match.group(0)
+
+        # Calculate typical amount (70% of max per SME feedback)
+        typical_amount = None
+        if max_amount:
+            typical_amount = int(max_amount * TYPICAL_PROJECT_PERCENT)
+
+        return ProjectFunding(
+            min_amount=min_amount,
+            max_amount=max_amount,
+            typical_amount=typical_amount,
+            display_text=display_text,
+        )
 
     def _extract_funding_rules(self, soup: BeautifulSoup) -> dict:
         """
