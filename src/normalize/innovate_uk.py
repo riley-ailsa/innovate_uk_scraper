@@ -326,8 +326,15 @@ def _parse_project_funding(project_size: Optional[str]) -> Tuple[Optional[int], 
     """
     Parse per-project funding amounts from project_size string.
 
+    Handles formats:
+    - "£150,000 to £750,000"
+    - "between £200,000 and £500,000"
+    - "up to £600,000"
+    - "total eligible costs can be up to £4 million"
+    - "grant funding request must not exceed £2 million"
+
     Args:
-        project_size: Project size string like "£150,000 to £750,000"
+        project_size: Project size string
 
     Returns:
         Tuple of (min_amount, max_amount) in GBP
@@ -335,50 +342,112 @@ def _parse_project_funding(project_size: Optional[str]) -> Tuple[Optional[int], 
     if not project_size:
         return None, None
 
-    # Pattern for range: "£X to £Y" or "£X - £Y"
-    range_pattern = r"£\s*([\d,]+)\s*(?:k|thousand)?\s*(?:to|-)\s*£\s*([\d,]+)\s*(k|thousand|m|million)?"
-    match = re.search(range_pattern, project_size, re.IGNORECASE)
+    # Normalize text
+    text = project_size.lower()
 
+    # Pattern 1: Range with "to" or "and" - "£X to £Y"
+    range_pattern = r'£\s*([\d,]+(?:\.\d+)?)\s*([km])?\s*(?:to|and|-)\s*£\s*([\d,]+(?:\.\d+)?)\s*([km]|million|thousand)?'
+    match = re.search(range_pattern, text, re.IGNORECASE)
     if match:
-        min_str = match.group(1).replace(",", "")
-        max_str = match.group(2).replace(",", "")
-        mult = match.group(3)
+        min_str = match.group(1).replace(',', '')
+        min_mag = match.group(2) or ''
+        max_str = match.group(3).replace(',', '')
+        max_mag = match.group(4) or ''
 
-        min_val = float(min_str)
-        max_val = float(max_str)
+        try:
+            min_amount = float(min_str)
+            max_amount = float(max_str)
 
-        # Apply multiplier to max (and min if it's small)
-        if mult:
-            mult_lower = mult.lower()
-            if mult_lower in ("k", "thousand"):
-                max_val *= 1_000
-                if min_val < 1000:
-                    min_val *= 1_000
-            elif mult_lower in ("m", "million"):
-                max_val *= 1_000_000
-                if min_val < 1000:
-                    min_val *= 1_000
+            # Apply magnitude to min
+            if 'm' in min_mag.lower() or 'million' in min_mag.lower():
+                min_amount *= 1_000_000
+            elif 'k' in min_mag.lower() or 'thousand' in min_mag.lower():
+                min_amount *= 1_000
 
-        return int(min_val), int(max_val)
+            # Apply magnitude to max
+            if 'm' in max_mag.lower() or 'million' in max_mag.lower():
+                max_amount *= 1_000_000
+            elif 'k' in max_mag.lower() or 'thousand' in max_mag.lower():
+                max_amount *= 1_000
 
-    # Pattern for single value: "up to £X"
-    single_pattern = r"(?:up to|maximum)\s*£\s*([\d,]+)\s*(k|thousand|m|million)?"
-    match = re.search(single_pattern, project_size, re.IGNORECASE)
+            return int(min_amount), int(max_amount)
+        except (ValueError, IndexError):
+            pass
 
+    # Pattern 2: "between £X and £Y" (alternative phrasing)
+    between_pattern = r'between £\s*([\d,]+(?:\.\d+)?)\s*([km]|million|thousand)?\s*and £\s*([\d,]+(?:\.\d+)?)\s*([km]|million|thousand)?'
+    match = re.search(between_pattern, text, re.IGNORECASE)
     if match:
-        max_str = match.group(1).replace(",", "")
-        mult = match.group(2)
+        min_str = match.group(1).replace(',', '')
+        min_mag = (match.group(2) or '').lower()
+        max_str = match.group(3).replace(',', '')
+        max_mag = (match.group(4) or '').lower()
 
-        max_val = float(max_str)
+        try:
+            min_amount = float(min_str)
+            max_amount = float(max_str)
 
-        if mult:
-            mult_lower = mult.lower()
-            if mult_lower in ("k", "thousand"):
-                max_val *= 1_000
-            elif mult_lower in ("m", "million"):
-                max_val *= 1_000_000
+            # Apply magnitudes
+            if 'm' in min_mag or 'million' in min_mag:
+                min_amount *= 1_000_000
+            elif 'k' in min_mag or 'thousand' in min_mag:
+                min_amount *= 1_000
 
-        return None, int(max_val)
+            if 'm' in max_mag or 'million' in max_mag:
+                max_amount *= 1_000_000
+            elif 'k' in max_mag or 'thousand' in max_mag:
+                max_amount *= 1_000
+
+            return int(min_amount), int(max_amount)
+        except ValueError:
+            pass
+
+    # Pattern 3: "up to £X" or "not exceed £X" (only max)
+    max_patterns = [
+        r'up to £\s*([\d,]+(?:\.\d+)?)\s*(k|m|million|thousand)?',
+        r'not exceed £\s*([\d,]+(?:\.\d+)?)\s*(k|m|million|thousand)?',
+        r'maximum.*?£\s*([\d,]+(?:\.\d+)?)\s*(k|m|million|thousand)?',
+        r'can apply for £\s*([\d,]+(?:\.\d+)?)\s*(k|m|million|thousand)?',
+        r'request.*?£\s*([\d,]+(?:\.\d+)?)\s*(k|m|million|thousand)?',
+    ]
+
+    for pattern in max_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            max_str = match.group(1).replace(',', '')
+            mag_str = (match.group(2) or '').lower()
+
+            try:
+                max_amount = float(max_str)
+
+                if 'm' in mag_str or 'million' in mag_str:
+                    max_amount *= 1_000_000
+                elif 'k' in mag_str or 'thousand' in mag_str:
+                    max_amount *= 1_000
+
+                return None, int(max_amount)
+            except ValueError:
+                pass
+
+    # Pattern 4: Plain amount like "£600,000" (when it's the only amount mentioned)
+    plain_amount_pattern = r'£\s*([\d,]+(?:\.\d+)?)\s*(k|m|million|thousand)?'
+    matches = re.findall(plain_amount_pattern, text, re.IGNORECASE)
+    if matches and len(matches) == 1:
+        # Only one amount mentioned, treat as max
+        amount_str = matches[0][0].replace(',', '')
+        mag_str = (matches[0][1] or '').lower()
+
+        try:
+            amount = float(amount_str)
+
+            if 'm' in mag_str or 'million' in mag_str:
+                amount *= 1_000_000
+            elif 'k' in mag_str or 'thousand' in mag_str:
+                amount *= 1_000
+
+            return None, int(amount)
+        except ValueError:
+            pass
 
     return None, None
 

@@ -1,7 +1,7 @@
-# Innovate UK Scraper - Requirements
+# Standardized requirements.txt for ALL scrapers
 
 # Web scraping
-requests==2.32.3
+requests==2.31.0
 beautifulsoup4==4.12.3
 urllib3==2.2.3
 
@@ -12,16 +12,19 @@ python-dateutil==2.9.0
 pymongo==4.10.1
 
 # Vector search
-pinecone-client==5.0.1
+pinecone-client==5.0.1  # Use pinecone-client, not pinecone
 
 # OpenAI
 openai==1.54.4
 
 # Progress bars
-tqdm==4.66.5
+tqdm==4.66.1
 
 # Environment variables
-python-dotenv==1.0.1
+python-dotenv==1.0.0
+
+# Excel export
+openpyxl==3.1.2
 
 # Optional: PDF parsing (if you enable resource fetching)
 # PyPDF2==3.0.1

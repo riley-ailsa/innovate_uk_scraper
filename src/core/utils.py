@@ -97,7 +97,7 @@ def clean_text(text: str) -> str:
 
 def extract_money_amount(text: str) -> Optional[str]:
     """
-    Extract money amounts from text (e.g., "£5 million", "£150,000").
+    Extract money amounts from text with improved pattern matching.
 
     Args:
         text: Text containing money amount
@@ -108,16 +108,43 @@ def extract_money_amount(text: str) -> Optional[str]:
     Examples:
         >>> extract_money_amount("Up to £5 million is available")
         'Up to £5 million'
+        >>> extract_money_amount("Prize pot of £250,000")
+        '£250,000'
     """
-    # Pattern: "up to £X million/thousand" or "£X to £Y"
     patterns = [
-        r'up to £[0-9,]+(?:\s*(?:million|thousand|billion))?',
-        r'£[0-9,]+(?:\s*(?:million|thousand|billion))?\s+to\s+£[0-9,]+(?:\s*(?:million|thousand|billion))?',
+        # With "up to" prefix AND magnitude word (highest priority)
+        r'up to £[\d,]+(?:\.\d+)?\s+(?:million|thousand|billion|k|m)\b',
+
+        # Range format
+        r'£[\d,]+(?:\.\d+)?\s*(?:million|thousand|billion|k|m)?\s+to\s+£[\d,]+(?:\.\d+)?\s*(?:million|thousand|billion|k|m)?',
+
+        # Prize-specific patterns
+        r'prize pot of £[\d,]+(?:\.\d+)?(?:\s*(?:million|thousand|k|m))?',
+        r'total prize fund of £[\d,]+(?:\.\d+)?(?:\s*(?:million|thousand|k|m))?',
+        r'prizes? worth £[\d,]+(?:\.\d+)?(?:\s*(?:million|thousand|k|m))?',
+        r'share of(?: a| an)? £[\d,]+(?:\.\d+)?(?:\s*(?:million|thousand|k|m))?',
+
+        # Amounts with clear formatting (£150,000 or £1.5million) - at least 4 digits
+        r'£[\d,]{4,}(?:\.\d+)?',
+
+        # Any amount with magnitude word
+        r'£[\d,]+(?:\.\d+)?\s*(?:million|thousand|billion|k|m)\b',
+
+        # Fallback: "up to £X" but only if number is large (4+ digits)
+        r'up to £[\d,]{4,}',
     ]
 
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return match.group(0)
+            amount_str = match.group(0)
+
+            # Validate: skip "up to £X" without magnitude if number is small
+            # This catches "up to £4" which is likely missing "million"
+            if re.match(r'^up to £\d{1,3}$', amount_str, re.IGNORECASE):
+                # Small number without magnitude - likely truncated, skip it
+                continue
+
+            return amount_str
 
     return None
