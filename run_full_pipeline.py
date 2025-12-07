@@ -460,7 +460,7 @@ def main():
     logger.info("Starting Innovate UK ingestion pipeline")
 
     # Load URLs
-    urls = load_urls("innovate_uk_urls.txt")
+    urls = load_urls("data/urls/innovate_uk_urls.txt")
     if not urls:
         print("❌ No URLs to process")
         logger.error("No URLs found to process")
